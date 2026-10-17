@@ -9,6 +9,7 @@ import {WebsiteBuyer} from "src/WebsiteBuyer.sol";
 import {IntakeAccount} from "src/IntakeAccount.sol";
 import {IIntake} from "src/interfaces/IIntake.sol";
 import {JsonText} from "src/libraries/JsonText.sol";
+import {SiteTemplate} from "./helpers/SiteTemplate.sol";
 import {BuyerTestBase} from "./helpers/BuyerTestBase.sol";
 import {MockToken, MockWETH} from "./mocks/MockToken.sol";
 
@@ -168,13 +169,26 @@ contract WebsiteBuyerEdgesTest is BuyerTestBase {
         for (uint256 i; i < 7; ++i) {
             WebsiteBuyer.Purchase memory stale = _quote();
             vm.startPrank(admin);
-            if (i == 0) buyer.setETHPrice(FEE);
-            else if (i == 1) buyer.setIntake(intake);
-            else if (i == 2) buyer.setIMD(address(token));
-            else if (i == 3) buyer.setAction(ACTION);
-            else if (i == 4) buyer.setTemplate(0, "Build a one-page website: ", "build-website", true, true);
-            else if (i == 5) buyer.setPool(IPoolManager(address(manager)), address(0), 3000, 60, IHooks(address(0)), "");
-            else buyer.setPaused(false);
+            if (i == 0) {
+                buyer.setETHPrice(FEE);
+            } else if (i == 1) {
+                buyer.setIntake(intake);
+            } else if (i == 2) {
+                buyer.setIMD(address(token));
+            } else if (i == 3) {
+                buyer.setAction(ACTION);
+            } else if (i == 4) {
+                buyer.setTemplate(
+                    0,
+                    SiteTemplate.parts("Build a one-page website: ", "build-website", true),
+                    SiteTemplate.slots(),
+                    true
+                );
+            } else if (i == 5) {
+                buyer.setPool(IPoolManager(address(manager)), address(0), 3000, 60, IHooks(address(0)), "");
+            } else {
+                buyer.setPaused(false);
+            }
             vm.stopPrank();
             assertEq(buyer.configurationVersion(), stale.configurationVersion + 1);
             vm.prank(alice);
@@ -198,24 +212,29 @@ contract WebsiteBuyerEdgesTest is BuyerTestBase {
         buyer.setPool(IPoolManager(address(manager)), address(0), 0x800000, 60, IHooks(address(0)), "");
         vm.expectRevert(WebsiteBuyer.InvalidPool.selector);
         buyer.setPool(IPoolManager(address(manager)), address(0), 3000, 60, IHooks(address(0)), new bytes(4097));
-        vm.expectRevert(JsonText.InvalidText.selector);
-        buyer.setTemplate(0, _repeat("a", 2001), "build-website", true, true);
-        vm.expectRevert(JsonText.InvalidText.selector);
-        buyer.setTemplate(0, "", "", true, true);
-        vm.expectRevert(JsonText.InvalidText.selector);
-        buyer.setTemplate(0, "", _repeat("a", 129), true, true);
+        WebsiteBuyer.Slot[] memory noWords = new WebsiteBuyer.Slot[](1);
+        noWords[0] = WebsiteBuyer.Slot.Caller;
+        bytes[] memory two = new bytes[](2);
+        vm.expectRevert(WebsiteBuyer.InvalidTemplate.selector);
+        buyer.setTemplate(0, two, noWords, true);
+        vm.expectRevert(WebsiteBuyer.InvalidTemplate.selector);
+        buyer.setTemplate(0, SiteTemplate.parts(_repeat("a", 8193), "build-website", true), SiteTemplate.slots(), true);
+        vm.expectRevert(WebsiteBuyer.InvalidTemplate.selector);
+        buyer.setTemplate(0, two, SiteTemplate.slots(), true);
         vm.stopPrank();
         assertEq(buyer.configurationVersion(), version);
-        assertEq(buyer.templateOf(0).skill, "build-website");
+        WebsiteBuyer.Template memory stored = buyer.templateOf(0);
+        assertEq(stored.parts.length, 3);
+        assertEq(string(stored.parts[1]), '","skill":"build-website","host":true,"owner":"');
         _buy(alice);
     }
 
     function testMaximumTemplateAndWordLengthsProduceParseableBoundedJSON() public {
-        string memory prefix = _repeat("p", 2000);
-        string memory skill = _repeat("s", 128);
+        string memory prefix = _repeat("p", 4000);
+        string memory skill = _repeat("s", 4000);
         string memory words = _repeat("w", 2000);
         vm.prank(admin);
-        buyer.setTemplate(type(uint256).max, prefix, skill, false, true);
+        buyer.setTemplate(type(uint256).max, SiteTemplate.parts(prefix, skill, false), SiteTemplate.slots(), true);
         string memory body = string(buyer.bodyOf(type(uint256).max, alice, words));
         assertEq(vm.parseJsonString(body, ".objective"), string.concat(prefix, words));
         assertEq(vm.parseJsonString(body, ".skill"), skill);

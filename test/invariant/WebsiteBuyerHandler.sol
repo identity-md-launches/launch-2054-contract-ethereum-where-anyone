@@ -7,6 +7,7 @@ import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {WebsiteBuyer} from "src/WebsiteBuyer.sol";
+import {SiteTemplate} from "../helpers/SiteTemplate.sol";
 import {IntakeAccount} from "src/IntakeAccount.sol";
 import {MockToken, MockWETH} from "../mocks/MockToken.sol";
 import {MockIntake} from "../mocks/MockIntake.sol";
@@ -250,7 +251,12 @@ contract WebsiteBuyerHandler is Test {
         } else if (mode == 5) {
             expectedEnabled = value % 4 != 0;
             expectedHost = value % 2 == 1;
-            buyer.setTemplate(0, "Build a one-page website: ", "build-website", expectedHost, expectedEnabled);
+            buyer.setTemplate(
+                0,
+                SiteTemplate.parts("Build a one-page website: ", "build-website", expectedHost),
+                SiteTemplate.slots(),
+                expectedEnabled
+            );
         } else if (mode == 6) {
             expectedAction = value % 2 == 0 ? bytes32("job.open@job-1") : bytes32("job.open@job-2");
             buyer.setAction(expectedAction);
@@ -426,7 +432,11 @@ contract WebsiteBuyerHandler is Test {
         assertEq(buyer.poolConfigured(), expectedRoute);
         assertEq(buyer.action(), expectedAction);
         WebsiteBuyer.Template memory template = buyer.templateOf(0);
-        assertEq(template.host, expectedHost);
+        assertEq(template.parts.length, 3);
+        assertEq(
+            keccak256(template.parts[1]),
+            keccak256(SiteTemplate.parts("Build a one-page website: ", "build-website", expectedHost)[1])
+        );
         assertEq(template.enabled, expectedEnabled);
         for (uint256 i; i < actors.length; ++i) {
             IntakeAccount account = buyer.accountOf(actors[i]);
