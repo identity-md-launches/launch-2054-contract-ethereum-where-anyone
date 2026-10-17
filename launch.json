@@ -1,0 +1,14 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "WebsiteBuyer",
+      "constructorArgs": [
+        "$owner",
+        "0xa43e6f75ee006411f79ac1c84120606c2330de82",
+        "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7"
+      ]
+    }
+  ],
+  "notes": "WebsiteBuyer takes the launch owner, Ethereum IdentityMD Intake v2 and the existing IMD token in that constructor order. It starts at 0.003 ETH with action job.open@job-1 and template 0: {\"objective\":\"Build a one-page website: <words>\",\"skill\":\"build-website\",\"host\":true}, adding the transaction caller as owner. Each purchase swaps the full payment for at least 0.5 IMD, the live Intake price and the caller's minimum, whichever is greatest; pays the Intake price; and retains surplus IMD. WebsiteBuyer creates an IntakeAccount for each user on their first purchase, preserving separate payer identity and user-controlled continuations. IntakeAccount is not a separate launch deployment. Authenticated Intake callbacks store and emit each request's result hash and URI, with a 192-byte URI limit. The launch owner can change the ETH price, Intake, IMD, templates, action and pool configuration, and pause purchases. The constructor leaves the pool unconfigured, so purchases revert until the owner selects and configures an existing liquid Uniswap v4 native ETH/IMD or wrapped ETH/IMD pool. This manifest performs no pool configuration or initialization calls. Live pool liquidity and request-body admission remain unverified by local tests."
+}
