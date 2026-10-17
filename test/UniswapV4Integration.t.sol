@@ -221,4 +221,60 @@ contract UniswapV4IntegrationTest is Test {
         _buy();
         assertEq(imd.balanceOf(treasury), 0.5 ether);
     }
+
+    /// forge-config: default.fuzz.runs = 256
+    function testFuzzRealPoolConservesValueAcrossChangingETHPrices(uint96 firstSeed, uint96 secondSeed) public {
+        _configure(address(0), IHooks(address(0)), true);
+        uint256 ethBefore = address(manager).balance;
+        uint256 tokensBefore = imd.balanceOf(address(manager));
+        uint256[2] memory payments =
+            [bound(firstSeed, 0.001 ether, 0.01 ether), bound(secondSeed, 0.001 ether, 0.01 ether)];
+        uint256 spent;
+        for (uint256 i; i < payments.length; ++i) {
+            vm.prank(owner);
+            buyer.setETHPrice(payments[i]);
+            WebsiteBuyer.Purchase memory p = _purchase();
+            p.minImdOut = 0.5 ether;
+            uint256 outputBefore = imd.balanceOf(address(buyer));
+            vm.prank(user);
+            bytes32 id = buyer.buyWebsite{value: payments[i]}("a site", p);
+            spent += payments[i];
+            assertGt(imd.balanceOf(address(buyer)), outputBefore);
+            assertEq(buyer.requestOf(address(intake), id).imdPaid, 0.5 ether);
+            assertEq(address(manager).balance, ethBefore + spent);
+            assertEq(imd.balanceOf(treasury), (i + 1) * 0.5 ether);
+            assertEq(
+                tokensBefore - imd.balanceOf(address(manager)), imd.balanceOf(address(buyer)) + imd.balanceOf(treasury)
+            );
+            assertEq(address(buyer).balance, 0);
+            assertEq(imd.balanceOf(address(buyer.accountOf(user))), 0);
+        }
+        assertEq(user.balance, 10 ether - spent);
+    }
+
+    function testRealWrappedPoolIntakeFailureRollsBackDepositAndPriceAndCanRetry() public {
+        MockWETH weth = new MockWETH();
+        weth.mint(address(seeder), 100_000 ether);
+        PoolKey memory key = _configure(address(weth), IHooks(address(0)), true);
+        uint256 wrappedBefore = weth.balanceOf(address(manager));
+        uint256 tokensBefore = imd.balanceOf(address(manager));
+        (uint160 sqrtBefore,,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        WebsiteBuyer.Purchase memory p = _purchase();
+        intake.setReject(true);
+        vm.prank(user);
+        vm.expectRevert("intake unavailable");
+        buyer.buyWebsite{value: 0.003 ether}("a site", p);
+        (uint160 sqrtAfter,,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        assertEq(sqrtAfter, sqrtBefore);
+        assertEq(weth.balanceOf(address(manager)), wrappedBefore);
+        assertEq(imd.balanceOf(address(manager)), tokensBefore);
+        assertEq(weth.balanceOf(address(buyer)), 0);
+        assertEq(address(weth).balance, 0);
+        assertEq(address(buyer.accountOf(user)), address(0));
+        assertEq(user.balance, 10 ether);
+        intake.setReject(false);
+        _buy();
+        assertEq(weth.balanceOf(address(manager)), wrappedBefore + 0.003 ether);
+        assertEq(imd.balanceOf(treasury), 0.5 ether);
+    }
 }
