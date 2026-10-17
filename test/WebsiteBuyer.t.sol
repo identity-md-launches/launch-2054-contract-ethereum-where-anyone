@@ -69,6 +69,37 @@ contract WebsiteBuyerTest is Test {
         return buyer.requestOf(address(intake), id).state;
     }
 
+    function _parts(bytes memory a, bytes memory b) internal pure returns (bytes[] memory p) {
+        p = new bytes[](2);
+        (p[0], p[1]) = (a, b);
+    }
+
+    function _parts(bytes memory a, bytes memory b, bytes memory c) internal pure returns (bytes[] memory p) {
+        p = new bytes[](3);
+        (p[0], p[1], p[2]) = (a, b, c);
+    }
+
+    function _slots(WebsiteBuyer.Slot a) internal pure returns (WebsiteBuyer.Slot[] memory s) {
+        s = new WebsiteBuyer.Slot[](1);
+        s[0] = a;
+    }
+
+    function _slots(WebsiteBuyer.Slot a, WebsiteBuyer.Slot b) internal pure returns (WebsiteBuyer.Slot[] memory s) {
+        s = new WebsiteBuyer.Slot[](2);
+        (s[0], s[1]) = (a, b);
+    }
+
+    /// @dev The brief's and the intake-client reference's job.open body, with no owner key.
+    function _setReferenceTemplate(uint256 id) internal {
+        vm.prank(owner);
+        buyer.setTemplate(
+            id,
+            _parts('{"objective":"Build a one-page website: ', '","skill":"build-website","host":true}'),
+            _slots(WebsiteBuyer.Slot.Words),
+            true
+        );
+    }
+
     function testPurchasePaysExactLivePriceAndRetainsSurplus() public {
         bytes32 id = _buy(alice);
         IntakeAccount account = buyer.accountOf(alice);
@@ -193,12 +224,36 @@ contract WebsiteBuyerTest is Test {
         assertEq(buyer.requestOf(address(intake), id).uri, string(uri));
     }
 
-    function testOversizedURIIsNotStoredAndMissingCallbackNeverBlocksPurchases() public {
+    function testOversizedURIRecordsHashAndEmitsFullURIUnderStipend() public {
         bytes32 id = _buy(alice);
+        bytes32 hash = keccak256("result");
+        bytes memory uri = new bytes(4096);
+        for (uint256 i; i < uri.length; ++i) {
+            uri[i] = "b";
+        }
+        vm.expectEmit(true, true, true, true, address(buyer));
+        emit WebsiteResult(id, alice, address(intake), hash, string(uri));
+        vm.cool(address(buyer));
         vm.prank(writer);
-        assertFalse(intake.complete(id, 0, keccak256("result"), string(new bytes(193)), 0));
+        assertTrue(intake.complete(id, 0, hash, string(uri), 0));
+        WebsiteBuyer.Request memory r = buyer.requestOf(address(intake), id);
+        assertEq(uint8(r.state), uint8(WebsiteBuyer.State.Done));
+        assertEq(r.resultHash, hash);
+        assertEq(bytes(r.uri).length, 0);
+        bytes32 next = _buy(alice);
+        vm.prank(writer);
+        assertTrue(intake.complete(next, 0, hash, string(new bytes(193)), 0));
+        assertEq(uint8(_state(next)), uint8(WebsiteBuyer.State.Done));
+        assertEq(buyer.requestOf(address(intake), next).resultHash, hash);
+    }
+
+    function testMissingCallbackNeverBlocksPurchases() public {
+        bytes32 id = _buy(alice);
         assertEq(uint8(_state(id)), uint8(WebsiteBuyer.State.Pending));
-        assertNotEq(_buy(alice), id);
+        bytes32 next = _buy(alice);
+        assertNotEq(next, id);
+        assertEq(uint8(_state(id)), uint8(WebsiteBuyer.State.Pending));
+        assertEq(imd.balanceOf(treasury), 2 * IMD_PRICE);
     }
 
     function testRefusalAndFailureSpendThePriceWithoutRefund() public {
@@ -293,8 +348,7 @@ contract WebsiteBuyerTest is Test {
         buyer.buyWebsite{value: ETH_PRICE}("x", p);
         vm.stopPrank();
         p.deadline = block.timestamp + 300;
-        vm.prank(owner);
-        buyer.setTemplate(0, "New objective: ", "build-website", true, true);
+        _setReferenceTemplate(0);
         vm.prank(alice);
         vm.expectRevert(WebsiteBuyer.ConfigurationChanged.selector);
         buyer.buyWebsite{value: ETH_PRICE}("x", p);
@@ -366,6 +420,32 @@ contract WebsiteBuyerTest is Test {
         buyer.buyWebsite{value: ETH_PRICE}("x", p);
     }
 
+    function testOwnerIMDFloorBindsWhenCallerSetsNoMinimum() public {
+        assertEq(buyer.imdFloor(), buyer.MIN_IMD_OUT());
+        WebsiteBuyer.Purchase memory stale = _purchase();
+        vm.prank(owner);
+        buyer.setIMDFloor(1.1 ether);
+        assertEq(buyer.configurationVersion(), stale.configurationVersion + 1);
+        vm.prank(alice);
+        vm.expectRevert(WebsiteBuyer.ConfigurationChanged.selector);
+        buyer.buyWebsite{value: ETH_PRICE}("x", stale);
+        WebsiteBuyer.Purchase memory p = _purchase();
+        p.minImdOut = 0;
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(WebsiteBuyer.InsufficientOutput.selector, 1 ether, 1.1 ether));
+        buyer.buyWebsite{value: ETH_PRICE}("x", p);
+        assertEq(manager.swaps(), 0);
+        assertEq(alice.balance, 10 ether);
+        vm.prank(owner);
+        buyer.setIMDFloor(1 ether);
+        p = _purchase();
+        p.minImdOut = 0;
+        vm.prank(alice);
+        buyer.buyWebsite{value: ETH_PRICE}("x", p);
+        assertEq(imd.balanceOf(address(buyer)), 0.5 ether);
+        assertEq(imd.balanceOf(treasury), IMD_PRICE);
+    }
+
     function testIntakeRevertAndIncorrectPullRevertSwapAndAccountCreation() public {
         WebsiteBuyer.Purchase memory p = _purchase();
         intake.setReject(true);
@@ -432,23 +512,94 @@ contract WebsiteBuyerTest is Test {
     }
 
     function testOwnerTemplatesHaveExactBodiesAndCanBeDisabled() public {
+        bytes[] memory parts =
+            _parts('{"objective":"Design: ', '","skill":"build-website","host":false,"owner":"', '"}');
+        WebsiteBuyer.Slot[] memory slots = _slots(WebsiteBuyer.Slot.Words, WebsiteBuyer.Slot.Caller);
         vm.prank(owner);
-        buyer.setTemplate(1, "Design: ", "build-website", false, true);
+        buyer.setTemplate(1, parts, slots, true);
         bytes memory expected = abi.encodePacked(
             '{"objective":"Design: hello","skill":"build-website","host":false,"owner":"',
             Strings.toHexString(bob),
             '"}'
         );
         assertEq(buyer.bodyOf(1, bob, "hello"), expected);
+        WebsiteBuyer.Template memory stored = buyer.templateOf(1);
+        assertEq(stored.parts.length, 3);
+        assertEq(stored.parts[1], parts[1]);
+        assertEq(uint8(stored.slots[1]), uint8(WebsiteBuyer.Slot.Caller));
+        assertTrue(stored.enabled);
         WebsiteBuyer.Purchase memory p = _purchase();
         p.templateId = 1;
         vm.prank(bob);
         bytes32 id = buyer.buyWebsite{value: ETH_PRICE}("hello", p);
         assertEq(intake.askOf(id).body, expected);
         vm.prank(owner);
-        buyer.setTemplate(1, "Design: ", "build-website", false, false);
+        buyer.setTemplate(1, parts, slots, false);
         vm.expectRevert(abi.encodeWithSelector(WebsiteBuyer.UnknownTemplate.selector, 1));
         buyer.bodyOf(1, bob, "hello");
+    }
+
+    function testOwnerCanDropTheOwnerKeyAndSendTheReferenceBody() public {
+        uint256 version = buyer.configurationVersion();
+        _setReferenceTemplate(0);
+        assertEq(buyer.configurationVersion(), version + 1);
+        bytes memory expected =
+            bytes('{"objective":"Build a one-page website: a bakery in Lisbon","skill":"build-website","host":true}');
+        assertEq(buyer.bodyOf(0, alice, "a bakery in Lisbon"), expected);
+        bytes32 id = _buy(alice);
+        assertEq(intake.askOf(id).body, expected);
+        // The project stays the caller's through their own payer account, with or without the owner key.
+        assertEq(intake.askOf(id).payer, address(buyer.accountOf(alice)));
+        assertEq(buyer.accountOf(alice).user(), alice);
+    }
+
+    function testTemplateKeySetCanChangeWithANewActionVersion() public {
+        bytes32 next = bytes32("job.open@job-2");
+        vm.startPrank(owner);
+        buyer.setAction(next);
+        buyer.setTemplate(
+            0,
+            _parts('{"objective":"Site for ', ": ", '","skill":"build-website","host":true,"deliver":true}'),
+            _slots(WebsiteBuyer.Slot.Caller, WebsiteBuyer.Slot.Words),
+            true
+        );
+        vm.stopPrank();
+        intake.setPrice(next, address(imd), IMD_PRICE);
+        bytes memory expected = abi.encodePacked(
+            '{"objective":"Site for ',
+            Strings.toHexString(alice),
+            ': a bakery in Lisbon","skill":"build-website","host":true,"deliver":true}'
+        );
+        bytes32 id = _buy(alice);
+        assertEq(intake.askOf(id).action, next);
+        assertEq(intake.askOf(id).body, expected);
+    }
+
+    function testInvalidTemplatesRevertAndKeepThePreviousTemplate() public {
+        bytes memory before = buyer.bodyOf(0, alice, "x");
+        bytes[] memory big = new bytes[](2);
+        big[0] = new bytes(4096);
+        big[1] = new bytes(4097);
+        WebsiteBuyer.Slot[] memory tooMany = new WebsiteBuyer.Slot[](9);
+        bytes[] memory tenParts = new bytes[](10);
+        WebsiteBuyer.Slot[] memory none = new WebsiteBuyer.Slot[](0);
+        vm.startPrank(owner);
+        vm.expectRevert(WebsiteBuyer.InvalidTemplate.selector);
+        buyer.setTemplate(0, _parts("{", "}"), none, true);
+        vm.expectRevert(WebsiteBuyer.InvalidTemplate.selector);
+        buyer.setTemplate(0, _parts("{", "}"), _slots(WebsiteBuyer.Slot.Caller), true);
+        vm.expectRevert(WebsiteBuyer.InvalidTemplate.selector);
+        buyer.setTemplate(0, _parts("{", ",", "}"), _slots(WebsiteBuyer.Slot.Words, WebsiteBuyer.Slot.Words), true);
+        vm.expectRevert(WebsiteBuyer.InvalidTemplate.selector);
+        buyer.setTemplate(0, tenParts, tooMany, true);
+        vm.expectRevert(WebsiteBuyer.InvalidTemplate.selector);
+        buyer.setTemplate(0, big, _slots(WebsiteBuyer.Slot.Words), true);
+        vm.stopPrank();
+        assertEq(buyer.bodyOf(0, alice, "x"), before);
+        big[1] = new bytes(4096);
+        vm.prank(owner);
+        buyer.setTemplate(0, big, _slots(WebsiteBuyer.Slot.Words), true);
+        assertEq(buyer.bodyOf(0, alice, "x").length, 8193);
     }
 
     function testSwapRejectsPartialInputOverspendAndInvalidCallbacks() public {
@@ -603,7 +754,9 @@ contract WebsiteBuyerTest is Test {
         vm.expectRevert(unauthorized);
         buyer.setAction(JOB_OPEN);
         vm.expectRevert(unauthorized);
-        buyer.setTemplate(0, "x", "build-website", true, true);
+        buyer.setTemplate(0, _parts("{", "}"), _slots(WebsiteBuyer.Slot.Words), true);
+        vm.expectRevert(unauthorized);
+        buyer.setIMDFloor(1 ether);
         vm.expectRevert(unauthorized);
         buyer.setPool(IPoolManager(address(manager)), address(0), 3000, 60, IHooks(address(0)), "");
         vm.expectRevert(unauthorized);
@@ -633,8 +786,8 @@ contract WebsiteBuyerTest is Test {
         buyer.setIMD(address(0));
         vm.expectRevert(WebsiteBuyer.InvalidAction.selector);
         buyer.setAction(0);
-        vm.expectRevert(JsonText.InvalidText.selector);
-        buyer.setTemplate(0, 'bad"', "build-website", true, true);
+        vm.expectRevert(WebsiteBuyer.InvalidFloor.selector);
+        buyer.setIMDFloor(0.5 ether - 1);
         vm.expectRevert(WebsiteBuyer.InvalidPool.selector);
         buyer.setPool(IPoolManager(address(manager)), address(imd), 3000, 60, IHooks(address(0)), "");
         vm.expectRevert(WebsiteBuyer.InvalidPool.selector);

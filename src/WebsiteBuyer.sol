@@ -31,6 +31,9 @@ contract WebsiteBuyer is Ownable2Step, ReentrancyGuard, IUnlockCallback {
     uint256 public constant MIN_IMD_OUT = 0.5 ether;
     uint256 public constant MAX_TEXT_BYTES = 2000;
     uint256 public constant MAX_RESULT_URI_BYTES = 192;
+    /// @notice Bounds keep the largest body (8192 + 2000 + 7 * 42 bytes) under Intake's 16 KiB limit.
+    uint256 public constant MAX_TEMPLATE_BYTES = 8192;
+    uint256 public constant MAX_TEMPLATE_SLOTS = 8;
 
     enum State {
         None,
@@ -39,10 +42,16 @@ contract WebsiteBuyer is Ownable2Step, ReentrancyGuard, IUnlockCallback {
         Failed
     }
 
+    /// @notice What fills a template slot: the caller's words, or the caller's address in lowercase hex.
+    enum Slot {
+        Words,
+        Caller
+    }
+
+    /// @notice The owner's JSON with gaps: parts[0] ++ fill(slots[0]) ++ parts[1] ++ ... ++ parts[n].
     struct Template {
-        string objectivePrefix;
-        string skill;
-        bool host;
+        bytes[] parts;
+        Slot[] slots;
         bool enabled;
     }
 
@@ -73,6 +82,8 @@ contract WebsiteBuyer is Ownable2Step, ReentrancyGuard, IUnlockCallback {
     error DependencyHasNoCode(address dependency);
     error UnsupportedDecimals();
     error UnknownTemplate(uint256 id);
+    error InvalidTemplate();
+    error InvalidFloor();
     error InvalidAction();
     error Paused();
     error Expired();
@@ -87,14 +98,14 @@ contract WebsiteBuyer is Ownable2Step, ReentrancyGuard, IUnlockCallback {
     error DuplicateRequest();
     error NotPending();
     error InvalidFailureStatus();
-    error URITooLong();
 
     event ConfigurationChangedTo(uint256 indexed version);
     event ETHPriceSet(uint256 price);
+    event IMDFloorSet(uint256 floor);
     event IntakeSet(address indexed intake);
     event IMDSet(address indexed imd);
     event ActionSet(bytes32 indexed action);
-    event TemplateSet(uint256 indexed id, string objectivePrefix, string skill, bool host, bool enabled);
+    event TemplateSet(uint256 indexed id, bytes[] parts, Slot[] slots, bool enabled);
     event PoolSet(address indexed manager, address indexed inputCurrency, bytes32 indexed poolId, bytes hookData);
     event PoolDisabled();
     event PauseSet(bool paused);
@@ -118,6 +129,8 @@ contract WebsiteBuyer is Ownable2Step, ReentrancyGuard, IUnlockCallback {
     );
 
     uint256 public ethPrice = 0.003 ether;
+    /// @notice Owner's minimum fresh IMD per purchase, never below MIN_IMD_OUT. Protects the retained surplus.
+    uint256 public imdFloor = MIN_IMD_OUT;
     uint256 public configurationVersion = 1;
     IIntake public intake;
     address public imd;
@@ -141,12 +154,20 @@ contract WebsiteBuyer is Ownable2Step, ReentrancyGuard, IUnlockCallback {
         if (address(intake_) == address(0) || imd_ == address(0)) revert InvalidAddress();
         intake = intake_;
         imd = imd_;
-        _templates[0] = Template("Build a one-page website: ", "build-website", true, true);
+        // The brief's body with the caller as owner. Owner-settable, so the key set can change without a redeploy.
+        bytes[] memory parts = new bytes[](3);
+        parts[0] = '{"objective":"Build a one-page website: ';
+        parts[1] = '","skill":"build-website","host":true,"owner":"';
+        parts[2] = '"}';
+        Slot[] memory slots = new Slot[](2);
+        slots[0] = Slot.Words;
+        slots[1] = Slot.Caller;
+        _storeTemplate(0, parts, slots, true);
         emit IntakeSet(address(intake_));
         emit IMDSet(imd_);
         emit ETHPriceSet(ethPrice);
+        emit IMDFloorSet(MIN_IMD_OUT);
         emit ActionSet(action);
-        emit TemplateSet(0, "Build a one-page website: ", "build-website", true, true);
     }
 
     /// @notice Spend exactly ethPrice, receiving fresh IMD, and buy one job for msg.sender.
@@ -171,8 +192,9 @@ contract WebsiteBuyer is Ownable2Step, ReentrancyGuard, IUnlockCallback {
         uint256 price = intake.priceOf(action, imd);
         if (price == 0) revert ActionNotSold();
         if (price > purchase.maxIntakePrice) revert IntakePriceExceeded(price, purchase.maxIntakePrice);
+        // The buyer has no stake in the surplus, so the owner's floor bounds what a sandwich can take from it.
         uint256 minimum = purchase.minImdOut;
-        if (minimum < MIN_IMD_OUT) minimum = MIN_IMD_OUT;
+        if (minimum < imdFloor) minimum = imdFloor;
         if (minimum < price) minimum = price;
         uint256 bought = _buyIMD(minimum);
         requestId = _open(body, purchase.templateId, price, bought);
@@ -277,24 +299,17 @@ contract WebsiteBuyer is Ownable2Step, ReentrancyGuard, IUnlockCallback {
         return abi.encode(output);
     }
 
-    /// @notice Exact request bytes, including the caller as lowercase owner; preview before payment.
-    function bodyOf(uint256 id, address user, string calldata words) public view returns (bytes memory) {
+    /// @notice Exact request bytes for `user`, with Caller slots as lowercase hex; preview before payment.
+    function bodyOf(uint256 id, address user, string calldata words) public view returns (bytes memory body) {
         if (user == address(0)) revert InvalidAddress();
         Template storage t = _templates[id];
         if (!t.enabled) revert UnknownTemplate(id);
         JsonText.check(bytes(words), MAX_TEXT_BYTES, false);
-        return abi.encodePacked(
-            '{"objective":"',
-            t.objectivePrefix,
-            words,
-            '","skill":"',
-            t.skill,
-            '","host":',
-            t.host ? "true" : "false",
-            ',"owner":"',
-            Strings.toHexString(user),
-            '"}'
-        );
+        body = t.parts[0];
+        for (uint256 i; i < t.slots.length; ++i) {
+            bytes memory fill = t.slots[i] == Slot.Caller ? bytes(Strings.toHexString(user)) : bytes(words);
+            body = bytes.concat(body, fill, t.parts[i + 1]);
+        }
     }
 
     function templateOf(uint256 id) external view returns (Template memory) {
@@ -306,12 +321,12 @@ contract WebsiteBuyer is Ownable2Step, ReentrancyGuard, IUnlockCallback {
     }
 
     /// @notice Unsigned Intake result. Store and emit only; no value is released by a callback.
+    /// @dev A URI over MAX_RESULT_URI_BYTES is not stored, to fit the 200,000 gas stipend, but is emitted in full.
     function onIntakeResult(bytes32 requestId, bytes32 resultHash, string calldata uri) external nonReentrant {
         Request storage r = _pending(requestId);
-        if (bytes(uri).length > MAX_RESULT_URI_BYTES) revert URITooLong();
         r.state = State.Done;
         r.resultHash = resultHash;
-        r.uri = uri;
+        if (bytes(uri).length <= MAX_RESULT_URI_BYTES) r.uri = uri;
         emit WebsiteResult(requestId, r.user, msg.sender, resultHash, uri);
     }
 
@@ -364,16 +379,48 @@ contract WebsiteBuyer is Ownable2Step, ReentrancyGuard, IUnlockCallback {
         _changed();
     }
 
-    function setTemplate(uint256 id, string calldata prefix, string calldata skill, bool host, bool enabled)
+    /// @notice Raise the minimum fresh IMD per purchase. Set it from a fresh quote of ethPrice on the configured
+    /// pool, less the slippage the owner tolerates, and revisit it whenever the price, pool or market moves.
+    function setIMDFloor(uint256 floor) external onlyOwner nonReentrant {
+        if (floor < MIN_IMD_OUT) revert InvalidFloor();
+        imdFloor = floor;
+        emit IMDFloorSet(floor);
+        _changed();
+    }
+
+    /// @notice The owner's JSON parts around exactly one Words slot and any Caller slots. Parts are not parsed:
+    /// put each slot inside a JSON string and preflight sample bodies with the Intake's checker before enabling.
+    function setTemplate(uint256 id, bytes[] calldata parts, Slot[] calldata slots, bool enabled)
         external
         onlyOwner
         nonReentrant
     {
-        JsonText.check(bytes(prefix), MAX_TEXT_BYTES, true);
-        JsonText.check(bytes(skill), 128, false);
-        _templates[id] = Template(prefix, skill, host, enabled);
-        emit TemplateSet(id, prefix, skill, host, enabled);
+        _storeTemplate(id, parts, slots, enabled);
         _changed();
+    }
+
+    function _storeTemplate(uint256 id, bytes[] memory parts, Slot[] memory slots, bool enabled) private {
+        if (parts.length != slots.length + 1 || slots.length > MAX_TEMPLATE_SLOTS) revert InvalidTemplate();
+        uint256 words;
+        for (uint256 i; i < slots.length; ++i) {
+            if (slots[i] == Slot.Words) ++words;
+        }
+        uint256 size;
+        for (uint256 i; i < parts.length; ++i) {
+            size += parts[i].length;
+        }
+        if (words != 1 || size > MAX_TEMPLATE_BYTES) revert InvalidTemplate();
+        Template storage t = _templates[id];
+        delete t.parts;
+        delete t.slots;
+        for (uint256 i; i < parts.length; ++i) {
+            t.parts.push(parts[i]);
+        }
+        for (uint256 i; i < slots.length; ++i) {
+            t.slots.push(slots[i]);
+        }
+        t.enabled = enabled;
+        emit TemplateSet(id, parts, slots, enabled);
     }
 
     /// @notice Choose an existing native ETH/IMD or wrapped ETH/IMD pool. Does not create or seed a pool.

@@ -54,6 +54,47 @@ contract LiquiditySeeder is IUnlockCallback {
     }
 }
 
+/// @dev Test-only exact-input trader, used as a sandwiching searcher.
+contract Swapper is IUnlockCallback {
+    using SafeERC20 for IERC20;
+    IPoolManager internal immutable manager;
+
+    constructor(IPoolManager manager_) {
+        manager = manager_;
+    }
+
+    receive() external payable {}
+
+    function swap(PoolKey memory key, bool zeroForOne, uint256 amountIn) external {
+        manager.unlock(abi.encode(key, zeroForOne, amountIn));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager));
+        (PoolKey memory key, bool zeroForOne, uint256 amountIn) = abi.decode(data, (PoolKey, bool, uint256));
+        uint160 limit = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+        BalanceDelta delta = manager.swap(key, IPoolManager.SwapParams(zeroForOne, -int256(amountIn), limit), "");
+        _move(key.currency0, delta.amount0());
+        _move(key.currency1, delta.amount1());
+        return "";
+    }
+
+    function _move(Currency currency, int128 delta) private {
+        if (delta > 0) {
+            manager.take(currency, address(this), uint256(uint128(delta)));
+        } else if (delta < 0) {
+            uint256 amount = uint256(-int256(delta));
+            manager.sync(currency);
+            if (Currency.unwrap(currency) == address(0)) {
+                manager.settle{value: amount}();
+            } else {
+                IERC20(Currency.unwrap(currency)).safeTransfer(address(manager), amount);
+                manager.settle();
+            }
+        }
+    }
+}
+
 /// @dev Leaves an ERC-20 synced before a native swap settles; consumers must explicitly sync native.
 contract SyncDuringSwap {
     IPoolManager private immutable manager;
@@ -211,6 +252,38 @@ contract UniswapV4IntegrationTest is Test {
         }
         assertEq(imd.balanceOf(treasury), 1 ether);
         assertEq(address(buyer).balance, 0);
+    }
+
+    /// @dev The reviewer's 0.05% pool: without a floor, a 1.3 ETH front-run took ~98.7% of the surplus at a profit.
+    function testOwnerFloorStopsSandwichOfSurplusOnLowFeePool() public {
+        PoolKey memory key =
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(imd)), 500, 10, IHooks(address(0)));
+        manager.initialize(key, TickMath.getSqrtPriceAtTick(69080));
+        seeder.seed(key, 30 ether);
+        vm.startPrank(owner);
+        buyer.setPool(manager, address(0), 500, 10, IHooks(address(0)), "");
+        // A fresh quote for 0.003 ETH is about 2.4888 IMD; the owner tolerates about 5%.
+        buyer.setIMDFloor(2.36 ether);
+        vm.stopPrank();
+        Swapper searcher = new Swapper(manager);
+        vm.deal(address(searcher), 2 ether);
+        // The buyer sets no minimum of their own: they get the same website whatever the swap returns.
+        WebsiteBuyer.Purchase memory p =
+            WebsiteBuyer.Purchase(0, 0, 0.5 ether, block.timestamp + 120, buyer.configurationVersion());
+
+        searcher.swap(key, true, 1.3 ether);
+        vm.prank(user);
+        vm.expectPartialRevert(WebsiteBuyer.InsufficientOutput.selector);
+        buyer.buyWebsite{value: 0.003 ether}("a florist in Kyoto", p);
+        assertEq(user.balance, 10 ether);
+        assertEq(intake.count(), 0);
+        searcher.swap(key, false, imd.balanceOf(address(searcher)));
+        assertLt(address(searcher).balance, 2 ether);
+
+        vm.prank(user);
+        buyer.buyWebsite{value: 0.003 ether}("a florist in Kyoto", p);
+        assertGe(imd.balanceOf(address(buyer)), 2.36 ether - 0.5 ether);
+        assertEq(imd.balanceOf(treasury), 0.5 ether);
     }
 
     function testNativeSettlementResetsCurrencySyncedByPoolHook() public {
